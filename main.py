@@ -6,7 +6,6 @@ import apkmirror
 import github
 
 from apkmirror import Version, Variant
-# 🚀 merge_apk を追加インポート
 from utils import panic, publish_release, patch_apk, merge_apk 
 from download_bins import download_apkeditor, download_morphe_cli, download_release_asset
 
@@ -16,10 +15,12 @@ def get_latest_version_from_kt(url: str) -> str | None:
     with urllib.request.urlopen(req) as response:
         content = response.read().decode('utf-8')
 
+    # "20.45.36" のようなバージョン番号の文字列をすべて抽出
     versions = re.findall(r'"(\d+\.\d+\.\d+)"', content)
     if not versions:
         return None
         
+    # バージョンを数値のリストとして比較し、最も新しいもの（最大値）を取得
     versions.sort(key=lambda s: [int(u) for u in s.split('.')])
     return versions[-1]
 
@@ -70,7 +71,7 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
         print(f"  -> [WARNING] Could not snipe the URL for {target_version}.")
         return None, None
 
-    # 🚀 変更点: forcebaseapk の罠を避けるため、通常APKではなく Bundle (.apkm) を積極的に狙う
+    # 1. まずは Bundle (.apkm) を積極的に狙う（YouTubeなど巨大アプリの 403 回避用）
     for variant in variants:
         if variant.is_bundle:
             arch = variant.architecture.lower()
@@ -78,7 +79,7 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
                 print(f"  -> [SUCCESS] Valid BUNDLE APK found: {arch}")
                 return target_v, variant
                 
-    # Bundleがなければ通常APKを探す
+    # 2. Bundleがなければ、単体の通常APKを探す（YouTube Musicなど単体提供用）
     for variant in variants:
         if not variant.is_bundle:
             arch = variant.architecture.lower()
@@ -88,6 +89,7 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
                 
     print(f"  -> [WARNING] No valid APK found for {target_version}.")
     return None, None
+
 
 # [STEP 3] ビルド実行: デフォルト推奨パッチ全適用モード
 def build_target_apk(target_name: str, target_data: dict, input_apk: str):
@@ -100,7 +102,7 @@ def build_target_apk(target_name: str, target_data: dict, input_apk: str):
 
     patch_apk(
         cli, patches, input_apk,
-        includes=[], 
+        includes=[], # 空にすることでデフォルト推奨パッチを全適用
         excludes=[],
         out=output_apk,
     )
@@ -111,33 +113,48 @@ def build_target_apk(target_name: str, target_data: dict, input_apk: str):
     print(f"  -> [SUCCESS] {output_apk} successfully built!")
     return output_apk
 
+
 # [STEP 4] 処理統合: ダウンロード〜マージ〜ビルドのパイプライン
 def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Variant, ytm_variant: Variant):
     print("\n[STEP 4] Downloading tools and base APKs...")
     
-    # 🚀 マージ用ツール (APKEditor) の準備
     download_apkeditor()
 
     # YouTubeのダウンロードとマージ処理
     yt_input = None
     if yt_variant:
-        print("  -> Downloading YouTube base APK (.apkm)...")
-        # 拡張子を .apkm にして保存することで forcebaseapk=true の付与を回避
-        apkmirror.download_apk(yt_variant, path="youtube_base.apkm")
-        if os.path.exists("youtube_base.apkm"):
-            print("  -> Merging YouTube Bundle into a single APK...")
-            merge_apk("youtube_base.apkm")
-            yt_input = "youtube_base_merged.apk" # apkeditor のデフォルト出力名
+        is_yt_bundle = yt_variant.is_bundle
+        ext = ".apkm" if is_yt_bundle else ".apk"
+        
+        print(f"  -> Downloading YouTube base {ext}...")
+        apkmirror.download_apk(yt_variant, path=f"youtube_base{ext}")
+        
+        if os.path.exists(f"youtube_base{ext}"):
+            if is_yt_bundle:
+                print("  -> Merging YouTube Bundle into a single APK...")
+                merge_apk("youtube_base.apkm")
+                yt_input = "youtube_base_merged.apk"
+            else:
+                print("  -> Base is already a single APK. Skipping merge.")
+                yt_input = "youtube_base.apk"
 
     # YouTube Musicのダウンロードとマージ処理
     ytm_input = None
     if ytm_variant:
-        print("  -> Downloading YouTube Music base APK (.apkm)...")
-        apkmirror.download_apk(ytm_variant, path="ytmusic_base.apkm")
-        if os.path.exists("ytmusic_base.apkm"):
-            print("  -> Merging YouTube Music Bundle into a single APK...")
-            merge_apk("ytmusic_base.apkm")
-            ytm_input = "ytmusic_base_merged.apk"
+        is_ytm_bundle = ytm_variant.is_bundle
+        ext = ".apkm" if is_ytm_bundle else ".apk"
+        
+        print(f"  -> Downloading YouTube Music base {ext}...")
+        apkmirror.download_apk(ytm_variant, path=f"ytmusic_base{ext}")
+        
+        if os.path.exists(f"ytmusic_base{ext}"):
+            if is_ytm_bundle:
+                print("  -> Merging YouTube Music Bundle into a single APK...")
+                merge_apk("ytmusic_base.apkm")
+                ytm_input = "ytmusic_base_merged.apk"
+            else:
+                print("  -> Base is already a single APK. Skipping merge.")
+                ytm_input = "ytmusic_base.apk"
 
     print("\n[STEP 5] Preparing Morphe CLI...")
     download_morphe_cli()
@@ -167,7 +184,9 @@ def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Va
     )
     print("  -> [DONE] Release successfully published!")
 
+
 # バージョンの新旧比較ロジック
+# プレリリース部分（例: dev.10 と dev.9）も正しく数値として比較する完全版。
 def version_greater(v1: str, v2: str) -> bool:
     print(f"\n[DEBUG] Comparing: '{v1}' > '{v2}' ?")
 
@@ -211,6 +230,7 @@ def version_greater(v1: str, v2: str) -> bool:
             return result
 
     return len(pre1) > len(pre2)
+
 
 # メインシーケンス
 def main():
@@ -264,6 +284,7 @@ def main():
         return
 
     process(final_patch_ver, morpheRelease, target_data, yt_variant, ytm_variant)
+
 
 if __name__ == "__main__":
     main()
