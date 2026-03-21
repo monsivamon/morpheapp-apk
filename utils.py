@@ -25,31 +25,33 @@ def panic(message: str):
     exit(1)
 
 
-# 【修正箇所①】常にスクレイパーを使い、Referer（どこから来たか）を偽装する！
-def download(link: str, out: str, headers=None, use_scraper=True): # 🚀 デフォルトをTrueに変更
+# 指定したURLからファイルをダウンロードしてローカルに保存する。
+# 🚀 403 Forbidden 対策: 最終兵器「curl_cffi」を投入し、Chromeブラウザに完全偽装する
+def download(link: str, out: str, headers=None, use_scraper=True):
     if os.path.exists(out):
         print(f"{out} already exists skipping download")
         return
 
-    print(f"  -> [DEBUG] Downloading with Cloudscraper...")
+    print(f"  -> [DEBUG] Downloading with curl_cffi (Ultimate Chrome Impersonation)...")
     
     if headers is None:
         headers = {}
     
-    # 🚀 403 Forbidden対策: APKMirror内からボタンを押したように偽装
+    # 403対策: アリバイ工作（サイト内からの遷移だと偽装）
     if "Referer" not in headers:
         headers["Referer"] = "https://www.apkmirror.com/"
 
-    if use_scraper:
-        r = get_scraper().get(link, stream=True, headers=headers)
-    else:
-        r = requests.get(link, stream=True, headers=headers)
-    
     try:
+        # cloudscraperではなく、curl_cffi を局所的に呼び出して通信を偽装する
+        from curl_cffi import requests as cffi_requests
+        
+        # impersonate="chrome" で最新Chromeの暗号化方式を完全再現し、Cloudflareを突破
+        r = cffi_requests.get(link, stream=True, headers=headers, impersonate="chrome")
         r.raise_for_status()
+        
     except Exception as e:
-        # エラーが起きたら何番（403等）で弾かれたか分かりやすく表示
-        print(f"\n  -> [FATAL ERROR] Download blocked by server! (Status: {r.status_code})")
+        status = getattr(r, 'status_code', 'Unknown') if 'r' in locals() else 'Unknown'
+        print(f"\n  -> [FATAL ERROR] Download blocked by server! (Status: {status})")
         print(f"  -> Target URL: {link}")
         panic(f"Error details: {e}")
         
