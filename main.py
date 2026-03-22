@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import urllib.request
 import apkmirror
 import github
@@ -15,12 +16,9 @@ def get_latest_version_from_kt(url: str) -> str | None:
     with urllib.request.urlopen(req) as response:
         content = response.read().decode('utf-8')
 
-    # "20.45.36" のようなバージョン番号の文字列をすべて抽出
     versions = re.findall(r'"(\d+\.\d+\.\d+)"', content)
-    if not versions:
-        return None
+    if not versions: return None
         
-    # バージョンを数値のリストとして比較し、最も新しいもの（最大値）を取得
     versions.sort(key=lambda s: [int(u) for u in s.split('.')])
     return versions[-1]
 
@@ -29,19 +27,53 @@ def get_target_versions() -> dict:
     ytm_url = "https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/heads/main/patches/src/main/kotlin/app/morphe/patches/music/shared/Constants.kt"
 
     print("  -> Fetching target versions from Morphe Kotlin files...")
-    
     yt_version = get_latest_version_from_kt(yt_url)
     ytm_version = get_latest_version_from_kt(ytm_url)
 
     return {
-        "youtube": {"version": yt_version},
-        "ytmusic": {"version": ytm_version}
+        "youtube": {"version": yt_version, "patches": []},
+        "ytmusic": {"version": ytm_version, "patches": []}
     }
+
+# patches-list.json から「推奨(use: true)」と「必須(パッケージ名変更)」を抽出
+def extract_patches_from_json() -> dict:
+    url = "https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/heads/main/patches-list.json"
+    print(f"  -> Extracting patches from {url}...")
+    
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        panic(f"Failed to load patches-list.json: {e}")
+
+    yt_patches = []
+    ytm_patches = []
+
+    # インストールに絶対必要なパッチ（use: false でも強制的にリストにねじ込む）
+    mandatory_patches = ["Change package name"]
+
+    for patch in data.get("patches", []):
+        patch_name = patch.get("name")
+        compat = patch.get("compatiblePackages")
+        is_use_true = patch.get("use", False) 
+        
+        # "use: true" の推奨パッチ、または "必須パッチ" の場合のみ採用してリスト化
+        if not is_use_true and patch_name not in mandatory_patches:
+            continue
+
+        if isinstance(compat, dict):
+            if "com.google.android.youtube" in compat: 
+                yt_patches.append(patch_name)
+            if "com.google.android.apps.youtube.music" in compat: 
+                ytm_patches.append(patch_name)
+                
+    return {"youtube": yt_patches, "ytmusic": ytm_patches}
+
 
 # [STEP 2] APK取得: リスト画面を無視し、URLを予測して直接狙い撃つ
 def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> tuple[Version | None, Variant | None]:
-    if not target_version:
-        return None, None
+    if not target_version: return None, None
         
     print(f"  -> [SNIPER MODE] Predicting direct URL for {app_id} v{target_version}...")
     slug_version = target_version.replace('.', '-')
@@ -71,7 +103,6 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
         print(f"  -> [WARNING] Could not snipe the URL for {target_version}.")
         return None, None
 
-    # 1. まずは Bundle (.apkm) を積極的に狙う（YouTubeなど巨大アプリの 403 回避用）
     for variant in variants:
         if variant.is_bundle:
             arch = variant.architecture.lower()
@@ -79,7 +110,6 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
                 print(f"  -> [SUCCESS] Valid BUNDLE APK found: {arch}")
                 return target_v, variant
                 
-    # 2. Bundleがなければ、単体の通常APKを探す（YouTube Musicなど単体提供用）
     for variant in variants:
         if not variant.is_bundle:
             arch = variant.architecture.lower()
@@ -91,18 +121,19 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
     return None, None
 
 
-# [STEP 3] ビルド実行: デフォルト推奨パッチ全適用モード
+# [STEP 3] ビルド実行: 抽出したパッチリストを強制適用モード
 def build_target_apk(target_name: str, target_data: dict, input_apk: str):
     patches = "bins/patches.mpp"
     cli = "bins/morphe-cli.jar"
     version = target_data["version"]
+    all_patches = target_data["patches"]
     
     output_apk = f"{target_name}-morphe-v{version}.apk"
-    print(f"  -> Building {output_apk} (Applying all default patches)...")
+    print(f"  -> Building {output_apk} (Force applying {len(all_patches)} patches!)...")
 
     patch_apk(
         cli, patches, input_apk,
-        includes=[], # 空にすることでデフォルト推奨パッチを全適用
+        includes=all_patches,
         excludes=[],
         out=output_apk,
     )
@@ -117,10 +148,8 @@ def build_target_apk(target_name: str, target_data: dict, input_apk: str):
 # [STEP 4] 処理統合: ダウンロード〜マージ〜ビルドのパイプライン
 def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Variant, ytm_variant: Variant):
     print("\n[STEP 4] Downloading tools and base APKs...")
-    
     download_apkeditor()
 
-    # YouTubeのダウンロードとマージ処理
     yt_input = None
     if yt_variant:
         is_yt_bundle = yt_variant.is_bundle
@@ -138,7 +167,6 @@ def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Va
                 print("  -> Base is already a single APK. Skipping merge.")
                 yt_input = "youtube_base.apk"
 
-    # YouTube Musicのダウンロードとマージ処理
     ytm_input = None
     if ytm_variant:
         is_ytm_bundle = ytm_variant.is_bundle
@@ -156,9 +184,14 @@ def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Va
                 print("  -> Base is already a single APK. Skipping merge.")
                 ytm_input = "ytmusic_base.apk"
 
-    print("\n[STEP 5] Preparing Morphe CLI...")
+    print("\n[STEP 5] Preparing Morphe CLI & Parsing Patches...")
     download_morphe_cli()
     
+    # JSON直リンクから「推奨＋必須パッチ」を抽出して target_data にセット
+    patch_lists = extract_patches_from_json()
+    target_data["youtube"]["patches"] = patch_lists["youtube"]
+    target_data["ytmusic"]["patches"] = patch_lists["ytmusic"]
+
     print(f"\n[STEP 6] Building patched APKs...")
     outputs = []
     
@@ -186,10 +219,8 @@ def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Va
 
 
 # バージョンの新旧比較ロジック
-# プレリリース部分（例: dev.10 と dev.9）も正しく数値として比較する完全版。
 def version_greater(v1: str, v2: str) -> bool:
     print(f"\n[DEBUG] Comparing: '{v1}' > '{v2}' ?")
-
     def normalize(v: str):
         v = v.lstrip('v')
         parts = v.split('-', 1)
@@ -198,8 +229,7 @@ def version_greater(v1: str, v2: str) -> bool:
 
         main_nums = re.findall(r'\d+', main_part)
         main_nums = [int(n) for n in main_nums[:3]]
-        while len(main_nums) < 3:
-            main_nums.append(0)
+        while len(main_nums) < 3: main_nums.append(0)
 
         pre_parts = []
         if prerelease_part:
@@ -284,7 +314,6 @@ def main():
         return
 
     process(final_patch_ver, morpheRelease, target_data, yt_variant, ytm_variant)
-
 
 if __name__ == "__main__":
     main()
