@@ -16,11 +16,26 @@ def get_latest_version_from_kt(url: str) -> str | None:
     with urllib.request.urlopen(req) as response:
         content = response.read().decode('utf-8')
 
-    versions = re.findall(r'"(\d+\.\d+\.\d+)"', content)
-    if not versions: return None
+    # AppTarget( から ) までのブロックをそれぞれ抽出
+    blocks = re.findall(r'AppTarget\s*\((.*?)\)', content, re.DOTALL)
+    
+    stable_versions = []
+    for block in blocks:
+        # "isExperimental = true" の記述があればスキップ
+        if re.search(r'isExperimental\s*=\s*true', block):
+            continue
+            
+        # 安定版ブロックからバージョン番号を抽出
+        v_match = re.search(r'version\s*=\s*"(\d+\.\d+\.\d+)"', block)
+        if v_match:
+            stable_versions.append(v_match.group(1))
+
+    if not stable_versions:
+        return None
         
-    versions.sort(key=lambda s: [int(u) for u in s.split('.')])
-    return versions[-1]
+    # バージョンを数値のリストとして比較し、最も新しい安定版を取得
+    stable_versions.sort(key=lambda s: [int(u) for u in s.split('.')])
+    return stable_versions[-1]
 
 def get_target_versions() -> dict:
     yt_url = "https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/heads/main/patches/src/main/kotlin/app/morphe/patches/youtube/shared/Constants.kt"
@@ -216,104 +231,3 @@ def process(patch_version: str, morpheRelease, target_data: dict, yt_variant: Va
         f"Morphe {patch_version}"
     )
     print("  -> [DONE] Release successfully published!")
-
-
-# バージョンの新旧比較ロジック
-def version_greater(v1: str, v2: str) -> bool:
-    print(f"\n[DEBUG] Comparing: '{v1}' > '{v2}' ?")
-    def normalize(v: str):
-        v = v.lstrip('v')
-        parts = v.split('-', 1)
-        main_part = parts[0]
-        prerelease_part = parts[1] if len(parts) > 1 else ""
-
-        main_nums = re.findall(r'\d+', main_part)
-        main_nums = [int(n) for n in main_nums[:3]]
-        while len(main_nums) < 3: main_nums.append(0)
-
-        pre_parts = []
-        if prerelease_part:
-            for part in re.split(r'(\d+)', prerelease_part):
-                if part == '': continue
-                if part.isdigit(): pre_parts.append(int(part))
-                else: pre_parts.append(part)
-
-        return main_nums, pre_parts
-
-    nums1, pre1 = normalize(v1)
-    nums2, pre2 = normalize(v2)
-
-    for i in range(3):
-        if nums1[i] != nums2[i]:
-            result = nums1[i] > nums2[i]
-            print(f"  -> Numeric check pos {i+1}: {nums1[i]} vs {nums2[i]} -> {result}")
-            return result
-
-    if not pre1 and pre2: return True
-    if pre1 and not pre2: return False
-
-    for p1, p2 in zip(pre1, pre2):
-        if p1 != p2:
-            if type(p1) == type(p2): result = p1 > p2
-            else: result = str(p1) > str(p2)
-            print(f"  -> Prerelease check: {p1} vs {p2} -> {result}")
-            return result
-
-    return len(pre1) > len(pre2)
-
-
-# メインシーケンス
-def main():
-    repo_url: str = "monsivamon/morpheapp-apk" 
-    yt_url: str = "https://www.apkmirror.com/apk/google-inc/youtube/"
-    ytm_url: str = "https://www.apkmirror.com/apk/google-inc/youtube-music/"
-
-    print("\n[STEP 1] Fetching the latest Morphe patches from GitHub...")
-    morpheRelease = download_release_asset(
-        "MorpheApp/morphe-patches",
-        r".*\.mpp$",
-        "bins",
-        "patches.mpp",
-        include_prereleases=True
-    )
-    final_patch_ver = morpheRelease["tag_name"]
-    print(f"  -> Latest Morphe patch: {final_patch_ver}")
-
-    print("\n[STEP 2] Verifying build history for updates...")
-    last_build_version = github.get_last_build_version(repo_url)
-    last_ver_patch = last_build_version.tag_name if last_build_version else None
-
-    print(f"  -> Target Patch: {final_patch_ver}")
-    print(f"  -> Previous Build Patch: {last_ver_patch}")
-
-    is_new_patch = False
-    if last_ver_patch is None:
-        print("  -> No previous release found. Treating as initial build.")
-        is_new_patch = True
-    else:
-        is_new_patch = version_greater(final_patch_ver, last_ver_patch)
-
-    if not is_new_patch:
-        print("\n  -> [EXIT] No updates for Morphe patches. Skipping build.")
-        return
-
-    print("\n  -> [RESULT] Patch update detected! Initiating build sequence.")
-
-    print("\n[STEP 3] Fetching target APK versions from Constants.kt...")
-    target_data = get_target_versions()
-    yt_target_ver = target_data["youtube"]["version"]
-    ytm_target_ver = target_data["ytmusic"]["version"]
-    print(f"  -> Target YouTube version: {yt_target_ver}")
-    print(f"  -> Target YT Music version: {ytm_target_ver}")
-
-    yt_v, yt_variant = get_target_apk_variant(yt_url, yt_target_ver, "youtube")
-    ytm_v, ytm_variant = get_target_apk_variant(ytm_url, ytm_target_ver, "youtube-music")
-
-    if not yt_variant and not ytm_variant:
-        print("  -> [EXIT] Could not find any valid APK variants on APKMirror.")
-        return
-
-    process(final_patch_ver, morpheRelease, target_data, yt_variant, ytm_variant)
-
-if __name__ == "__main__":
-    main()
