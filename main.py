@@ -126,7 +126,7 @@ def fetch_patches_json(tag: str) -> list:
     except Exception as e:
         panic(f"Failed to load patches-list.json: {e}")
 
-# 対象アプリがサポートするAPKバージョンのリストをJSON（新旧フォーマット両対応）から抽出し、直近5件を返す
+# 対象アプリがサポートするAPKバージョンのリストを抽出
 def get_supported_versions(patches_list: list, package_name: str) -> list:
     versions_set = set()
     for patch in patches_list:
@@ -144,7 +144,9 @@ def get_supported_versions(patches_list: list, package_name: str) -> list:
                     if pkg.get("targets"):
                         for target in pkg.get("targets"):
                             if isinstance(target, dict) and target.get("version"):
-                                versions_set.add(target.get("version"))
+                                # isExperimental が True の場合はスキップする
+                                if not target.get("isExperimental", False):
+                                    versions_set.add(target.get("version"))
 
     def parse_ver(v):
         return [int(x) for x in re.findall(r'\d+', v)]
@@ -152,7 +154,7 @@ def get_supported_versions(patches_list: list, package_name: str) -> list:
     sorted_versions = sorted(list(versions_set), key=parse_ver)
     return sorted_versions[-5:]
 
-# 指定APKバージョンと互換性のある全パッチをJSON（新旧フォーマット両対応）から抽出する
+# 指定APKバージョンと互換性のある全パッチを抽出
 def get_patches_for_version(patches_list: list, package_name: str, target_version: str) -> list:
     patches = []
     for patch in patches_list:
@@ -173,7 +175,9 @@ def get_patches_for_version(patches_list: list, package_name: str, target_versio
                     extracted_versions = set(pkg.get("versions", []))
                     for target in pkg.get("targets", []):
                         if isinstance(target, dict) and target.get("version"):
-                            extracted_versions.add(target.get("version"))
+                            # isExperimental が True の場合は抽出対象外とする
+                            if not target.get("isExperimental", False):
+                                extracted_versions.add(target.get("version"))
                             
                     if not extracted_versions or target_version in extracted_versions:
                         supports_version = True
