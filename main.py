@@ -21,12 +21,12 @@ from apkmirror import Version, Variant
 from utils import patch_apk, merge_apk 
 from download_bins import download_apkeditor, download_morphe_cli
 
-# 致命的なエラー時に例外をスローしてプロセスを安全に中断させる
+# 致命的なエラー発生時にメッセージを出力し、プロセスを安全に中断させる
 def panic(msg):
     print(f"  -> [FATAL] {msg}")
     raise ProcessExitException(msg)
 
-# バージョン文字列を数値的に比較し、v1がv2より新しければTrueを返す
+# 2つのバージョン文字列を数値的に比較し、v1がv2より新しければTrueを返す
 def version_greater(v1: str | None, v2: str | None) -> bool:
     if not v1: return False
     if not v2: return True
@@ -53,7 +53,7 @@ def version_greater(v1: str | None, v2: str | None) -> bool:
             return p1 > p2 if type(p1) == type(p2) else str(p1) > str(p2)
     return len(pre1) > len(pre2)
 
-# リポジトリのリリース一覧を取得し、バージョン文字列で正確にソートして最新版を返す
+# GitHubリポジトリからリリース一覧を取得し、バージョン文字列で降順ソートして最新版を返す
 def get_latest_releases(repo: str, require_mpp: bool = False) -> dict:
     print(f"  -> Fetching release history for {repo}...")
     cmd = ["gh", "api", f"repos/{repo}/releases?per_page=30"]
@@ -94,7 +94,7 @@ def get_latest_releases(repo: str, require_mpp: bool = False) -> dict:
         "pre": valid_pre[0] if valid_pre else None
     }
 
-# GitHubリリースを作成、または既存のリリースにアセットを追記する
+# GitHubリリースを新規作成、または既存リリースにアセットを追加アップロードする
 def publish_github_release(tag_name: str, files: list, message: str, title: str, is_prerelease: bool):
     release_type = "Pre-release" if is_prerelease else "Stable release"
     print(f"  -> Publishing {release_type}: {tag_name}...")
@@ -102,7 +102,7 @@ def publish_github_release(tag_name: str, files: list, message: str, title: str,
     res = subprocess.run(check_cmd, capture_output=True)
     
     if res.returncode == 0:
-        print("  -> Release already exists! Uploading assets to the existing release...")
+        print("  -> Release already exists. Uploading assets to the existing release...")
         subprocess.run(["gh", "release", "upload", tag_name] + files + ["--clobber"], check=True)
     else:
         print("  -> Creating new release...")
@@ -111,10 +111,10 @@ def publish_github_release(tag_name: str, files: list, message: str, title: str,
         try:
             subprocess.run(cmd_create, check=True)
         except subprocess.CalledProcessError:
-            print("  -> Create failed (likely race condition). Falling back to upload...")
+            print("  -> Release creation failed (race condition). Falling back to upload...")
             subprocess.run(["gh", "release", "upload", tag_name] + files + ["--clobber"], check=True)
 
-# Morpheリポジトリから指定タグの patches-list.json を取得してパースする
+# Morpheリポジトリから指定タグの patches-list.json を取得し、パースする
 def fetch_patches_json(tag: str) -> list:
     url = f"https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/tags/{tag}/patches-list.json"
     print(f"  -> Fetching patches from {url}...")
@@ -126,17 +126,25 @@ def fetch_patches_json(tag: str) -> list:
     except Exception as e:
         panic(f"Failed to load patches-list.json: {e}")
 
-# 対象アプリがサポートするAPKバージョンのリストをJSONから抽出し、直近5件をソートして返す
+# 対象アプリがサポートするAPKバージョンのリストをJSON（新旧フォーマット両対応）から抽出し、直近5件を返す
 def get_supported_versions(patches_list: list, package_name: str) -> list:
     versions_set = set()
     for patch in patches_list:
         compat = patch.get("compatiblePackages")
+        if not compat: continue
+
         if isinstance(compat, dict) and package_name in compat:
-            if compat[package_name]: versions_set.update(compat[package_name])
+            if compat[package_name]: 
+                versions_set.update(compat[package_name])
         elif isinstance(compat, list):
             for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("name") == package_name:
-                    if pkg.get("versions"): versions_set.update(pkg.get("versions"))
+                if isinstance(pkg, dict) and pkg.get("packageName") == package_name:
+                    if pkg.get("versions"): 
+                        versions_set.update(pkg.get("versions"))
+                    if pkg.get("targets"):
+                        for target in pkg.get("targets"):
+                            if isinstance(target, dict) and target.get("version"):
+                                versions_set.add(target.get("version"))
 
     def parse_ver(v):
         return [int(x) for x in re.findall(r'\d+', v)]
@@ -144,7 +152,7 @@ def get_supported_versions(patches_list: list, package_name: str) -> list:
     sorted_versions = sorted(list(versions_set), key=parse_ver)
     return sorted_versions[-5:]
 
-# 指定APKバージョンと互換性のある全パッチを、デフォルトの有効/無効設定を無視して抽出する
+# 指定APKバージョンと互換性のある全パッチをJSON（新旧フォーマット両対応）から抽出する
 def get_patches_for_version(patches_list: list, package_name: str, target_version: str) -> list:
     patches = []
     for patch in patches_list:
@@ -154,14 +162,21 @@ def get_patches_for_version(patches_list: list, package_name: str, target_versio
         supports_version = False
         if not compat: 
             supports_version = True
-        elif isinstance(compat, dict) and package_name in compat:
-            versions = compat[package_name]
-            if not versions or target_version in versions: supports_version = True
+        elif isinstance(compat, dict):
+            if package_name in compat:
+                versions = compat[package_name]
+                if not versions or target_version in versions:
+                    supports_version = True
         elif isinstance(compat, list):
             for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("name") == package_name:
-                    versions = pkg.get("versions", [])
-                    if not versions or target_version in versions: supports_version = True
+                if isinstance(pkg, dict) and pkg.get("packageName") == package_name:
+                    extracted_versions = set(pkg.get("versions", []))
+                    for target in pkg.get("targets", []):
+                        if isinstance(target, dict) and target.get("version"):
+                            extracted_versions.add(target.get("version"))
+                            
+                    if not extracted_versions or target_version in extracted_versions:
+                        supports_version = True
                     break
 
         if supports_version:
@@ -169,7 +184,7 @@ def get_patches_for_version(patches_list: list, package_name: str, target_versio
 
     return patches
 
-# APKMirrorをスクレイピングし、ダウンロード可能な対象バージョンのVariantを取得する
+# APKMirrorをスクレイピングし、ダウンロード可能な対象バージョンのVariant情報を取得する
 def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> tuple[Version | None, Variant | None]:
     if not target_version: return None, None
     print(f"  -> Predicting direct URL for {app_id} v{target_version}...")
@@ -209,17 +224,17 @@ def build_target_apk(target_name: str, version: str, patches_to_apply: list, inp
     patch_apk(cli, patches, input_apk, includes=patches_to_apply, excludes=[], out=output_apk)
     
     if not os.path.exists(output_apk): panic(f"Failed to build {output_apk}")
-    print(f"  -> [SUCCESS] {output_apk} successfully built!")
+    print(f"  -> [SUCCESS] {output_apk} successfully built.")
     return output_apk
 
-# ビルド環境の一時ファイルや過去のAPKを削除する
+# ビルド環境の一時ファイルや過去の出力済みAPKをクリーンアップする
 def clean_workspace():
     for f in ["youtube_base.apk", "youtube_base.apkm", "youtube_base_merged.apk", "ytmusic_base.apk", "ytmusic_base.apkm", "ytmusic_base_merged.apk", "bins/patches.mpp"]:
         if os.path.exists(f): os.remove(f)
     for f in os.listdir("."):
         if f.endswith(".apk") and "morphe-v" in f: os.remove(f)
 
-# 候補バージョンを最新から順に試行し、ブロックされた場合は古いバージョンへフォールバックする
+# サポート対象バージョンを最新から順に試行し、取得に失敗した場合は古いバージョンへフォールバックする
 def download_with_fallback(app_id: str, base_url: str, supported_versions: list):
     for version in reversed(supported_versions): 
         print(f"\n  -> [FALLBACK ROUTINE] Trying to fetch v{version} for {app_id}...")
@@ -237,7 +252,7 @@ def download_with_fallback(app_id: str, base_url: str, supported_versions: list)
         try:
             apkmirror.download_apk(variant, path=filepath)
             if os.path.exists(filepath):
-                print(f"  -> [SUCCESS] Successfully downloaded base APK for v{version}!")
+                print(f"  -> [SUCCESS] Base APK downloaded: v{version}")
                 if variant.is_bundle:
                     merge_apk(filepath)
                     return f"{filename}_merged.apk", version
@@ -252,7 +267,7 @@ def download_with_fallback(app_id: str, base_url: str, supported_versions: list)
 
     return None, None
 
-# パッチ取得からAPKダウンロード、ビルド、リリースまでのパイプラインを実行する
+# パッチ取得からAPKダウンロード、ビルド、GitHubリリースまでのパイプラインを実行する
 def process(tag: str, is_pre: bool, target_app: str):
     print(f"\n=======================================================")
     print(f"INITIATING BUILD PIPELINE FOR: {tag} ({target_app.upper()})")
@@ -310,9 +325,9 @@ def process(tag: str, is_pre: bool, target_app: str):
     message = f"Changelogs:\n[Morphe Patches {tag}](https://github.com/MorpheApp/morphe-patches/releases/tag/{tag})\n\n### Included Apps:\n{apps_str}"
     
     publish_github_release(tag, outputs, message, f"Morphe {tag}", is_pre)
-    print("  -> [DONE] Release successfully published!")
+    print("  -> [DONE] Release successfully published.")
 
-# バージョンを比較し、更新がある場合のみビルド処理を開始する
+# アップストリームと自リポジトリのバージョンを比較し、更新がある場合のみビルド処理を開始する
 def main():
     parser = argparse.ArgumentParser(description="Morphe Auto Builder")
     parser.add_argument("--app", choices=["youtube", "ytmusic", "all"], default="all", help="Which app to build")
@@ -345,11 +360,10 @@ def main():
         print("  -> [EXIT] No new updates found. Skipping build.")
         return
 
-    print(f"  -> [RESULT] Found {len(build_targets)} pending update(s)!")
+    print(f"  -> [RESULT] Found {len(build_targets)} pending update(s).")
     
     for target in build_targets:
         process(target["tag"], target["is_pre"], args.app)
 
 if __name__ == "__main__":
     main()
-    
