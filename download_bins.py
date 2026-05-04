@@ -63,5 +63,5 @@ def download_morphe_cli():
         r".*morphe-cli.*-all\.jar$",
         "bins",
         "morphe-cli.jar",
-        include_prereleases=True
+        include_prereleases=False
     )
