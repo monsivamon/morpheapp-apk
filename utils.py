@@ -5,6 +5,7 @@ import sys
 import time
 import random
 import requests
+import re
 
 _scraper = None
 
@@ -150,12 +151,24 @@ def patch_apk(
         print("------------------------", file=sys.stderr)
         result.check_returncode() 
 
-    # CLIの--outパラメータを使用せず、パッチ適用後のファイルをPython側でリネームし、指定パスへ移動する
+    # CLIの実行ログから「Saved to ...」を探し出し、動的に出力先ファイルパスを特定する
     if out is not None:
-        cli_output = f"{str(apk).removesuffix('.apk')}-patched.apk"
-        if os.path.exists(out):
-            os.unlink(out)
-        shutil.move(cli_output, out)
+        output_text = (result.stdout or "") + "\n" + (result.stderr or "")
+        match = re.search(r"Saved to\s+([^\r\n]+)", output_text)
+        
+        if not match:
+            print("[FATAL] Failed to parse output path from CLI log.", file=sys.stderr)
+            sys.exit(1)
+            
+        cli_output = match.group(1).strip()
+        
+        if os.path.exists(cli_output):
+            if os.path.exists(out):
+                os.unlink(out)
+            shutil.move(cli_output, out)
+        else:
+            print(f"[FATAL] Generated file could not be found: {cli_output}", file=sys.stderr)
+            sys.exit(1)
 
 
 # 指定したタグとファイル群を用いて、GitHubに新規リリースを作成（既存の場合は上書き）する

@@ -117,7 +117,7 @@ def publish_github_release(tag_name: str, files: list, message: str, title: str,
 # Morpheリポジトリから指定タグの patches-list.json を取得し、パースする
 def fetch_patches_json(tag: str) -> list:
     url = f"https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/tags/{tag}/patches-list.json"
-    print(f"  -> Fetching patches from {url}...")
+    print(f"  -> Fetching patches from {url}")
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req) as response:
@@ -126,33 +126,39 @@ def fetch_patches_json(tag: str) -> list:
     except Exception as e:
         panic(f"Failed to load patches-list.json: {e}")
 
-# 対象アプリがサポートするAPKバージョンのリストを抽出
-def get_supported_versions(patches_list: list, package_name: str) -> list:
-    versions_set = set()
+# 対象アプリがサポートするAPKバージョンのリストを抽出し、StableとExperimentalを分けて返す
+def get_supported_versions(patches_list: list, package_name: str) -> tuple[list, list]:
+    stable_versions = set()
+    exp_versions = set()
+    
     for patch in patches_list:
         compat = patch.get("compatiblePackages")
         if not compat: continue
 
         if isinstance(compat, dict) and package_name in compat:
             if compat[package_name]: 
-                versions_set.update(compat[package_name])
+                stable_versions.update(compat[package_name])
         elif isinstance(compat, list):
             for pkg in compat:
                 if isinstance(pkg, dict) and pkg.get("packageName") == package_name:
                     if pkg.get("versions"): 
-                        versions_set.update(pkg.get("versions"))
+                        stable_versions.update(pkg.get("versions"))
                     if pkg.get("targets"):
                         for target in pkg.get("targets"):
                             if isinstance(target, dict) and target.get("version"):
-                                # isExperimental が True の場合はスキップする
-                                if not target.get("isExperimental", False):
-                                    versions_set.add(target.get("version"))
+                                if target.get("isExperimental", False):
+                                    exp_versions.add(target.get("version"))
+                                else:
+                                    stable_versions.add(target.get("version"))
 
     def parse_ver(v):
         return [int(x) for x in re.findall(r'\d+', v)]
     
-    sorted_versions = sorted(list(versions_set), key=parse_ver)
-    return sorted_versions[-5:]
+    sorted_stable = sorted(list(stable_versions), key=parse_ver)
+    sorted_exp = sorted(list(exp_versions), key=parse_ver)
+    
+    # Stableは最新5件、Experimentalは最新3件をフォールバック対象として返す
+    return sorted_stable[-5:], sorted_exp[-3:]
 
 # 指定APKバージョンと互換性のある全パッチを抽出
 def get_patches_for_version(patches_list: list, package_name: str, target_version: str) -> list:
@@ -175,9 +181,7 @@ def get_patches_for_version(patches_list: list, package_name: str, target_versio
                     extracted_versions = set(pkg.get("versions", []))
                     for target in pkg.get("targets", []):
                         if isinstance(target, dict) and target.get("version"):
-                            # isExperimental が True の場合は抽出対象外とする
-                            if not target.get("isExperimental", False):
-                                extracted_versions.add(target.get("version"))
+                            extracted_versions.add(target.get("version"))
                             
                     if not extracted_versions or target_version in extracted_versions:
                         supports_version = True
@@ -219,11 +223,14 @@ def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> t
     return None, None
 
 # ベースAPKにパッチを適用し、最終的なAPKをビルドする
-def build_target_apk(target_name: str, version: str, patches_to_apply: list, input_apk: str):
+def build_target_apk(target_name: str, version: str, patches_to_apply: list, input_apk: str, is_experimental: bool = False):
     patches = "bins/patches.mpp"
     cli = "bins/morphe-cli.jar"
     
-    output_apk = f"{target_name}-morphe-v{version}.apk"
+    # Experimentalの場合はファイル名にサフィックスをつける
+    suffix = "-experimental" if is_experimental else ""
+    output_apk = f"{target_name}{suffix}-morphe-v{version}.apk"
+    
     print(f"  -> Building {output_apk} (Force applying {len(patches_to_apply)} patches)...")
     patch_apk(cli, patches, input_apk, includes=patches_to_apply, excludes=[], out=output_apk)
     
@@ -284,8 +291,8 @@ def process(tag: str, is_pre: bool, target_app: str):
 
     print("\n[STEP 4] Fetching target APK versions from patches-list.json...")
     patches_list = fetch_patches_json(tag)
-    yt_versions = get_supported_versions(patches_list, "com.google.android.youtube")
-    ytm_versions = get_supported_versions(patches_list, "com.google.android.apps.youtube.music")
+    yt_stable_vers, yt_exp_vers = get_supported_versions(patches_list, "com.google.android.youtube")
+    ytm_stable_vers, ytm_exp_vers = get_supported_versions(patches_list, "com.google.android.apps.youtube.music")
 
     yt_url = "https://www.apkmirror.com/apk/google-inc/youtube/"
     ytm_url = "https://www.apkmirror.com/apk/google-inc/youtube-music/"
@@ -297,29 +304,57 @@ def process(tag: str, is_pre: bool, target_app: str):
     download_apkeditor()
     download_morphe_cli()
 
+    # YouTube ビルドプロセス (Stable -> Experimental の順にビルド)
     if target_app in ["youtube", "all"]:
-        yt_input, final_yt_ver = download_with_fallback("youtube", yt_url, yt_versions)
-        if yt_input and final_yt_ver:
-            try:
-                yt_patches = get_patches_for_version(patches_list, "com.google.android.youtube", final_yt_ver)
-                outputs.append(build_target_apk("youtube", final_yt_ver, yt_patches, yt_input))
-                included_apps_text.append(f"- YouTube v{final_yt_ver}")
-            except BaseException as e:
-                print(f"  -> [WARNING] YouTube build failed: {e}")
-        else:
-            print("  -> [FATAL] All fallback attempts failed for YouTube.")
+        if yt_stable_vers:
+            yt_input, final_yt_ver = download_with_fallback("youtube", yt_url, yt_stable_vers)
+            if yt_input and final_yt_ver:
+                try:
+                    yt_patches = get_patches_for_version(patches_list, "com.google.android.youtube", final_yt_ver)
+                    outputs.append(build_target_apk("youtube", final_yt_ver, yt_patches, yt_input, False))
+                    included_apps_text.append(f"- YouTube v{final_yt_ver} (Stable)")
+                except BaseException as e:
+                    print(f"  -> [WARNING] YouTube Stable build failed: {e}")
+            else:
+                print("  -> [WARNING] All fallback attempts failed for YouTube Stable.")
 
+        if yt_exp_vers:
+            yt_exp_input, final_yt_exp_ver = download_with_fallback("youtube", yt_url, yt_exp_vers)
+            if yt_exp_input and final_yt_exp_ver:
+                try:
+                    yt_exp_patches = get_patches_for_version(patches_list, "com.google.android.youtube", final_yt_exp_ver)
+                    outputs.append(build_target_apk("youtube", final_yt_exp_ver, yt_exp_patches, yt_exp_input, True))
+                    included_apps_text.append(f"- YouTube v{final_yt_exp_ver} (Experimental)")
+                except BaseException as e:
+                    print(f"  -> [WARNING] YouTube Experimental build failed: {e}")
+            else:
+                print("  -> [WARNING] All fallback attempts failed for YouTube Experimental.")
+
+    # YT Music ビルドプロセス (Stable -> Experimental の順にビルド)
     if target_app in ["ytmusic", "all"]:
-        ytm_input, final_ytm_ver = download_with_fallback("youtube-music", ytm_url, ytm_versions)
-        if ytm_input and final_ytm_ver:
-            try:
-                ytm_patches = get_patches_for_version(patches_list, "com.google.android.apps.youtube.music", final_ytm_ver)
-                outputs.append(build_target_apk("ytmusic", final_ytm_ver, ytm_patches, ytm_input))
-                included_apps_text.append(f"- YouTube Music v{final_ytm_ver}")
-            except BaseException as e:
-                print(f"  -> [WARNING] YT Music build failed: {e}")
-        else:
-            print("  -> [FATAL] All fallback attempts failed for YT Music.")
+        if ytm_stable_vers:
+            ytm_input, final_ytm_ver = download_with_fallback("youtube-music", ytm_url, ytm_stable_vers)
+            if ytm_input and final_ytm_ver:
+                try:
+                    ytm_patches = get_patches_for_version(patches_list, "com.google.android.apps.youtube.music", final_ytm_ver)
+                    outputs.append(build_target_apk("ytmusic", final_ytm_ver, ytm_patches, ytm_input, False))
+                    included_apps_text.append(f"- YouTube Music v{final_ytm_ver} (Stable)")
+                except BaseException as e:
+                    print(f"  -> [WARNING] YT Music Stable build failed: {e}")
+            else:
+                print("  -> [WARNING] All fallback attempts failed for YT Music Stable.")
+
+        if ytm_exp_vers:
+            ytm_exp_input, final_ytm_exp_ver = download_with_fallback("youtube-music", ytm_url, ytm_exp_vers)
+            if ytm_exp_input and final_ytm_exp_ver:
+                try:
+                    ytm_exp_patches = get_patches_for_version(patches_list, "com.google.android.apps.youtube.music", final_ytm_exp_ver)
+                    outputs.append(build_target_apk("ytmusic", final_ytm_exp_ver, ytm_exp_patches, ytm_exp_input, True))
+                    included_apps_text.append(f"- YouTube Music v{final_ytm_exp_ver} (Experimental)")
+                except BaseException as e:
+                    print(f"  -> [WARNING] YT Music Experimental build failed: {e}")
+            else:
+                print("  -> [WARNING] All fallback attempts failed for YT Music Experimental.")
 
     if not outputs:
         panic("No APKs were built. Aborting release.")
