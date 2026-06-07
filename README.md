@@ -18,16 +18,16 @@ We highly recommend using **[MicroG-RE](https://github.com/MorpheApp/MicroG-RE)*
 ## ✨ Key Features & Improvements
 
 ### 1. Auto-Fallback Download System
-To combat aggressive anti-bot measures on APKMirror, the builder extracts a list of all supported APK versions from the patch JSON. If downloading the latest version is blocked, it automatically falls back to older compatible versions until a successful download is achieved.
+To combat aggressive anti-bot measures on APKMirror, the builder extracts a list of all supported APK versions from the Morphe CLI metadata. If downloading the latest version is blocked, it automatically falls back to older compatible versions until a successful download is achieved.
 
-### 2. Force-Apply Full Patching
-Instead of limiting features to official recommendations, the system dynamically parses Morphe's `patches-list.json` and forcefully applies **all compatible patches** for the successfully downloaded APK version, ensuring you get maximum features.
+### 2. Dynamic Patch Extraction via Morphe CLI
+Instead of relying on fragile upstream JSON files or Kotlin constants, the system dynamically parses patch metadata (including version compatibility) directly from the **Morphe CLI** text output and forcefully applies **all compatible patches** for the successfully downloaded APK version, ensuring you get maximum features.
 
 ### 3. Dual-Track Release System (Stable & Pre-release)
 The builder independently monitors the upstream repository for both **Stable** and **Pre-release** channels. It automatically triggers builds for both, appropriately tagging them on GitHub Releases, so you always have access to the latest channels.
 
-### 4. Powered by Morphe CLI & Daily Automation
-The build pipeline relies entirely on the modern **Morphe CLI** for fast, reliable patching, automatically running daily via GitHub Actions.
+### 4. Daily Automation
+The build pipeline relies entirely on the modern Morphe CLI for fast, reliable patching, automatically running daily via GitHub Actions.
 
 ## 📥 Download
 

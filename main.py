@@ -3,7 +3,6 @@ import os
 import re
 import time
 import json
-import urllib.request
 import subprocess
 import argparse
 import apkmirror
@@ -114,72 +113,106 @@ def publish_github_release(tag_name: str, files: list, message: str, title: str,
             print("  -> Release creation failed (race condition). Falling back to upload...")
             subprocess.run(["gh", "release", "upload", tag_name] + files + ["--clobber"], check=True)
 
-# パッチリスト(JSON)を取得・解析する
-def fetch_patches_json(tag: str) -> list:
-    url = f"https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/tags/{tag}/patches-list.json"
-    print(f"  -> Fetching patches from {url}...")
+# =======================================================================================
+# CLIのテキスト出力を解析し、MPPファイルから直接メタデータを生成する
+# =======================================================================================
+def extract_patches_metadata(cli_path: str, mpp_path: str) -> list:
+    print(f"  -> Extracting patch list dynamically from {mpp_path} via CLI...")
+    
+    cmd = ["java", "-jar", cli_path, "list-patches", f"--patches={mpp_path}", "-p", "-v"]
+    
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            return data.get("patches", []) if isinstance(data, dict) else data
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
+        out = result.stdout
+    except subprocess.CalledProcessError as e:
+        panic(f"Failed to extract patches from CLI. Error: {e.stderr}")
     except Exception as e:
-        panic(f"Failed to load patches-list.json: {e}")
+        panic(f"Failed to execute CLI command. Error: {e}")
 
-# Constants.ktから安定版(Stable)の対応バージョン一覧のみを抽出する
-def fetch_versions_from_constants(app_type: str, tag: str) -> list:
-    if app_type == "youtube":
-        url = f"https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/tags/{tag}/patches/src/main/kotlin/app/morphe/patches/youtube/shared/Constants.kt"
-    else:
-        url = f"https://raw.githubusercontent.com/MorpheApp/morphe-patches/refs/tags/{tag}/patches/src/main/kotlin/app/morphe/patches/music/shared/Constants.kt"
+    patches = []
+    current_patch = None
+    current_package = None
+    in_versions = False
+
+    for line in out.splitlines():
+        s_line = line.strip()
         
-    print(f"  -> Parsing Constants.kt for {app_type} (Tag: {tag})...")
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req) as response:
-            content = response.read().decode('utf-8')
-    except Exception as e:
-        print(f"  -> [WARNING] Failed to fetch constants for {app_type}: {e}")
-        return []
+        if not s_line:
+            continue
 
-    stable_versions = []
-    targets = re.findall(r'AppTarget\s*\((.*?)\)', content, re.DOTALL)
-    for target in targets:
-        version_match = re.search(r'version\s*=\s*"([\d\.]+)"', target)
-        if version_match:
-            version = version_match.group(1)
-            # Experimental は完全に無視し、Stableのみを収集
-            if 'isExperimental = true' not in target:
-                stable_versions.append(version)
-                
+        if s_line.startswith('Index:'):
+            current_patch = {"name": "", "compatiblePackages": []}
+            patches.append(current_patch)
+            current_package = None
+            in_versions = False
+            
+        elif s_line.startswith('Name:') and current_patch is not None:
+            current_patch["name"] = s_line[5:].strip()
+            
+        elif s_line.startswith('Package name:'):
+            pkg_name = s_line.split('Package name:', 1)[1].strip()
+            current_package = {"name": pkg_name, "versions": []}
+            if current_patch is not None:
+                current_patch["compatiblePackages"].append(current_package)
+            in_versions = False
+            
+        elif s_line.startswith('Compatible versions:'):
+            in_versions = True
+            
+        elif in_versions and current_package is not None:
+            if s_line[0].isdigit():
+                current_package["versions"].append(s_line)
+            else:
+                in_versions = False
+
+    if not patches:
+        panic("Could not parse any patch data from CLI text output.")
+        
+    return patches
+
+# 対象アプリがサポートするAPKバージョンのリストを抽出し、直近5件を古い順にソートして返す
+def get_supported_versions(patches_list: list, package_name: str) -> list:
+    versions_set = set()
+    for patch in patches_list:
+        compat = patch.get("compatiblePackages")
+        if isinstance(compat, dict) and package_name in compat:
+            if compat[package_name]: versions_set.update(compat[package_name])
+        elif isinstance(compat, list):
+            for pkg in compat:
+                if isinstance(pkg, dict) and pkg.get("name") == package_name:
+                    if pkg.get("versions"): versions_set.update(pkg.get("versions"))
+
     def parse_ver(v):
         return [int(x) for x in re.findall(r'\d+', v)]
     
-    stable_versions.sort(key=parse_ver)
-    return stable_versions[-5:]
+    sorted_versions = sorted(list(versions_set), key=parse_ver)
+    return sorted_versions[-5:]
 
-# パッケージ名に合致する全パッチを抽出する
-def get_all_patches_for_package(patches_list: list, package_name: str) -> list:
+# 指定されたAPKバージョンと互換性のあるすべてのパッチを抽出する
+def get_patches_for_version(patches_list: list, package_name: str, target_version: str) -> list:
     patches = []
     for patch in patches_list:
         patch_name = patch.get("name")
         compat = patch.get("compatiblePackages")
 
-        is_compatible = False
+        supports_version = False
         if not compat: 
-            is_compatible = True
+            supports_version = True
         elif isinstance(compat, dict) and package_name in compat:
-            is_compatible = True
+            versions = compat[package_name]
+            if not versions or target_version in versions: supports_version = True
         elif isinstance(compat, list):
             for pkg in compat:
-                if isinstance(pkg, dict) and pkg.get("packageName") == package_name:
-                    is_compatible = True
+                if isinstance(pkg, dict) and pkg.get("name") == package_name:
+                    versions = pkg.get("versions", [])
+                    if not versions or target_version in versions: supports_version = True
                     break
 
-        if is_compatible:
+        if supports_version:
             patches.append(patch_name)
 
     return patches
+
 
 # APKMirrorから最適なAPK情報を取得する
 def get_target_apk_variant(base_url: str, target_version: str, app_id: str) -> tuple[Version | None, Variant | None]:
@@ -276,11 +309,16 @@ def process(tag: str, is_pre: bool, target_app: str):
     
     clean_workspace()
 
-    print("\n[STEP 3] Downloading patches.mpp for the target version...")
+    print("\n[STEP 3] Downloading patches & CLI...")
     subprocess.run(["gh", "release", "download", tag, "-R", "MorpheApp/morphe-patches", "-p", "*.mpp", "-O", "bins/patches.mpp"], check=True)
+    download_apkeditor()
+    download_morphe_cli()
 
-    print("\n[STEP 4] Fetching target APK versions from Constants.kt and Patches from JSON...")
-    patches_list = fetch_patches_json(tag)
+    print("\n[STEP 4] Extracting metadata directly from Morphe CLI...")
+    patches_list = extract_patches_metadata("bins/morphe-cli.jar", "bins/patches.mpp")
+    if not patches_list:
+        panic("Extracted patch list is empty!")
+    print(f"  -> Successfully extracted {len(patches_list)} patches metadata.")
     
     yt_url = "https://www.apkmirror.com/apk/google-inc/youtube/"
     ytm_url = "https://www.apkmirror.com/apk/google-inc/youtube-music/"
@@ -288,35 +326,35 @@ def process(tag: str, is_pre: bool, target_app: str):
     outputs = []
     included_apps_text = []
 
-    print("\n[STEP 5] Downloading tools and base APKs with fallback...")
-    download_apkeditor()
-    download_morphe_cli()
+    print("\n[STEP 5] Building target APKs with fallback...")
 
     if target_app in ["youtube", "all"]:
-        yt_stable_vers = fetch_versions_from_constants("youtube", tag)
-        yt_patches = get_all_patches_for_package(patches_list, "com.google.android.youtube")
+        yt_versions = get_supported_versions(patches_list, "com.google.android.youtube")
+        print(f"\n[YOUTUBE] Discovered versions: {yt_versions}")
         
-        if yt_stable_vers:
-            yt_input, final_yt_ver = download_with_fallback("youtube", yt_url, yt_stable_vers)
+        if yt_versions:
+            yt_input, final_yt_ver = download_with_fallback("youtube", yt_url, yt_versions)
             if yt_input and final_yt_ver:
                 try:
+                    yt_patches = get_patches_for_version(patches_list, "com.google.android.youtube", final_yt_ver)
                     outputs.append(build_target_apk("youtube", final_yt_ver, yt_patches, yt_input))
                     included_apps_text.append(f"- YouTube v{final_yt_ver}")
                 except BaseException as e:
-                    print(f"  -> [WARNING] YouTube Stable build failed: {e}")
+                    print(f"  -> [WARNING] YouTube build failed: {e}")
 
     if target_app in ["ytmusic", "all"]:
-        ytm_stable_vers = fetch_versions_from_constants("ytmusic", tag)
-        ytm_patches = get_all_patches_for_package(patches_list, "com.google.android.apps.youtube.music")
+        ytm_versions = get_supported_versions(patches_list, "com.google.android.apps.youtube.music")
+        print(f"\n[YT MUSIC] Discovered versions: {ytm_versions}")
         
-        if ytm_stable_vers:
-            ytm_input, final_ytm_ver = download_with_fallback("youtube-music", ytm_url, ytm_stable_vers)
+        if ytm_versions:
+            ytm_input, final_ytm_ver = download_with_fallback("youtube-music", ytm_url, ytm_versions)
             if ytm_input and final_ytm_ver:
                 try:
+                    ytm_patches = get_patches_for_version(patches_list, "com.google.android.apps.youtube.music", final_ytm_ver)
                     outputs.append(build_target_apk("ytmusic", final_ytm_ver, ytm_patches, ytm_input))
                     included_apps_text.append(f"- YouTube Music v{final_ytm_ver}")
                 except BaseException as e:
-                    print(f"  -> [WARNING] YT Music Stable build failed: {e}")
+                    print(f"  -> [WARNING] YT Music build failed: {e}")
 
     if not outputs:
         panic("No APKs were built. Aborting release.")
