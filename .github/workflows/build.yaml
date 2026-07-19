@@ -1,4 +1,4 @@
-Name: Build MorpheApp APKs
+name: Build MorpheApp APKs
 
 on:
   schedule:
