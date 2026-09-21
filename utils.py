@@ -27,114 +27,57 @@ import random
 import requests
 import re
 
-_scraper = None
-
-# ブラウザ偽装ターゲット（curl_cffi の impersonate 用）
-_IMPERSONATE_TARGETS = ["chrome124", "chrome123", "chrome120"]
-
-# UA は impersonate と一致させる必要がある（不一致は即検出される）
-_UA_MAP = {
-    "chrome124": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "chrome123": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "chrome120": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
-
-# 実ブラウザに近づけるための共通ヘッダ
-_EXTRA_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-
-# 新しいセッションを生成する。curl_cffi > cloudscraper > requests の優先順
-def _build_session():
-    # 1) curl_cffi: TLS/HTTP2フィンガープリントを実ブラウザと一致させる（最優先）
+# Cloudflare のチャレンジページ（HTTP 200 で返ってくる）かどうかを判定する
+# チャレンジページには downloadButton 等の要素が無いため、ここで 403 相当に変換して
+# 無駄なバリアント試行（39個問題）を防ぐ
+def _is_challenge_page(res) -> bool:
+    if res is None or getattr(res, "status_code", None) != 200:
+        return False
     try:
-        from curl_cffi import requests as cffi_requests
-        target = random.choice(_IMPERSONATE_TARGETS)
-        s = cffi_requests.Session(impersonate=target, timeout=30)
-        s.headers.update(_EXTRA_HEADERS)
-        s.headers["User-Agent"] = _UA_MAP[target]
-        print(f"  -> [SESSION] curl_cffi impersonate={target}")
-        return s
-    except ImportError:
-        pass
-
-    # 2) cloudscraper: 古いIUAMチャレンジ用のフォールバック
-    try:
-        import cloudscraper
-        s = cloudscraper.create_scraper()
-        s.headers.update(_EXTRA_HEADERS)
-        s.headers["User-Agent"] = _UA_MAP["chrome124"]
-        print("  -> [SESSION] cloudscraper (fallback)")
-        return s
-    except ImportError:
-        pass
-
-    # 3) 最終手段
-    s = requests.Session()
-    s.headers.update(_EXTRA_HEADERS)
-    s.headers["User-Agent"] = _UA_MAP["chrome124"]
-    print("  -> [SESSION] requests (last resort)")
-    return s
-
-
-# セッションの .get() をラップし、403/例外時にセッションを再生成する
-def _install_wrapper(session):
-    original_get = session.get
-
-    # 403 や接続エラー時に「セッションを新しく作り直して再試行」するラッパー関数
-    def safe_get(url, **kwargs):
-        global _scraper
-        max_attempts = 4
-        for attempt in range(max_attempts):
-            # 人間によるアクセスを模倣するため、リクエスト前に1.5〜3.5秒のランダム待機を挟む
-            time.sleep(random.uniform(1.5, 3.5))
-
-            current = _scraper
-            try:
-                res = current._original_get(url, timeout=30, **kwargs)
-                # HTTPステータス200(成功) または 404(Not Found) の場合は正常応答として処理
-                if res.status_code in (200, 404):
-                    return res
-                print(
-                    f"  -> [WARNING] Cloudflare blocked (HTTP {res.status_code}). "
-                    f"Rotating session... (attempt {attempt + 1}/{max_attempts})"
-                )
-            except Exception as e:
-                print(
-                    f"  -> [WARNING] Connection error: {e}. "
-                    f"Rotating session... (attempt {attempt + 1}/{max_attempts})"
-                )
-
-            # 新しいフィンガープリントのセッションへ差し替え（UA・impersonate も再抽選）
-            _scraper = _install_wrapper(_build_session())
-            # 指数バックオフ（5秒 → 10秒 → 15秒 → 20秒）
-            time.sleep(5 * (attempt + 1))
-
-        # 再試行上限に達した場合は、安全なエラーハンドリングのためダミーのレスポンスを返す
-        class Dummy:
-            status_code = 403
-            content = b""
-            text = ""
-        return Dummy()
-
-    session._original_get = original_get
-    session.get = safe_get
-    return session
+        text = (res.text or "")[:5000]
+    except Exception:
+        return False
+    markers = (
+        "Just a moment",
+        "cf-chl-",
+        "__cf_chl_",
+        "Checking your browser",
+        "Attention Required",
+        "challenge-platform",
+        "cf_chl_opt",
+    )
+    return any(m in text for m in markers)
 
 
 # CloudflareのBot検知を回避するためのスクレイパーを取得する
-# 403を検知した場合はUA・TLSフィンガープリントを変えてセッションを自動再生成する
+# 実績のある cloudscraper をシングルトンで保持し、
+# チャレンジページ検出時は 403 相当のダミーレスポンスを返すラッパーを噛ませる
 def get_scraper():
     global _scraper
     if _scraper is None:
-        _scraper = _install_wrapper(_build_session())
+        import cloudscraper
+        _scraper = cloudscraper.create_scraper()
+        _scraper.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        })
+
+        original_get = _scraper.get
+
+        # チャレンジページを検出したら 403 相当のダミーを返すラッパー
+        def safe_get(url, **kwargs):
+            res = original_get(url, timeout=30, **kwargs)
+            if _is_challenge_page(res):
+                print("  -> [WARNING] Cloudflare challenge page detected (HTTP 200 -> treating as 403).")
+                class Dummy:
+                    status_code = 403
+                    content = b""
+                    text = ""
+                    headers = {}
+                return Dummy()
+            return res
+
+        _scraper.get = safe_get
+
     return _scraper
 
 
@@ -142,10 +85,6 @@ def get_scraper():
 def reset_scraper():
     global _scraper
     _scraper = None
-
-
-
-
 
 # 指定URLからファイルをチャンク単位でダウンロードし、保存する
 def download(link: str, out: str, headers=None, use_scraper=True):
