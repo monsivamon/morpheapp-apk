@@ -10,3 +10,5 @@ bins/
 # --- バックアップ  ---
 _backup/
 *.bak_*
+all_sources.txt
+all_sources.bat

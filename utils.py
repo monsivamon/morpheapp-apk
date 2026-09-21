@@ -7,6 +7,8 @@ import random
 import requests
 import re
 
+_scraper = None
+
 # 意図しないプロセス強制終了(sys.exit)を防ぐための例外
 class ProcessExitException(BaseException): pass
 
@@ -26,6 +28,8 @@ import time
 import random
 import requests
 import re
+
+_scraper = None
 
 # Cloudflare のチャレンジページ（HTTP 200 で返ってくる）かどうかを判定する
 # チャレンジページには downloadButton 等の要素が無いため、ここで 403 相当に変換して
