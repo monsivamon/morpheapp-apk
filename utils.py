@@ -7,58 +7,144 @@ import random
 import requests
 import re
 
+# 意図しないプロセス強制終了(sys.exit)を防ぐための例外
+class ProcessExitException(BaseException): pass
+
+def prevent_exit(code=0):
+    raise ProcessExitException(f"Process exit prevented! (exit code {code})")
+
+
+# エラー発生時にメッセージを出力して中断する
+def panic(message: str):
+    print(f"  -> [FATAL] {message}")
+    raise ProcessExitException(message)
+import os
+import shutil
+import subprocess
+import sys
+import time
+import random
+import requests
+import re
+
 _scraper = None
 
+# ブラウザ偽装ターゲット（curl_cffi の impersonate 用）
+_IMPERSONATE_TARGETS = ["chrome124", "chrome123", "chrome120"]
+
+# UA は impersonate と一致させる必要がある（不一致は即検出される）
+_UA_MAP = {
+    "chrome124": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "chrome123": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "chrome120": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
+
+# 実ブラウザに近づけるための共通ヘッダ
+_EXTRA_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+# 新しいセッションを生成する。curl_cffi > cloudscraper > requests の優先順
+def _build_session():
+    # 1) curl_cffi: TLS/HTTP2フィンガープリントを実ブラウザと一致させる（最優先）
+    try:
+        from curl_cffi import requests as cffi_requests
+        target = random.choice(_IMPERSONATE_TARGETS)
+        s = cffi_requests.Session(impersonate=target, timeout=30)
+        s.headers.update(_EXTRA_HEADERS)
+        s.headers["User-Agent"] = _UA_MAP[target]
+        print(f"  -> [SESSION] curl_cffi impersonate={target}")
+        return s
+    except ImportError:
+        pass
+
+    # 2) cloudscraper: 古いIUAMチャレンジ用のフォールバック
+    try:
+        import cloudscraper
+        s = cloudscraper.create_scraper()
+        s.headers.update(_EXTRA_HEADERS)
+        s.headers["User-Agent"] = _UA_MAP["chrome124"]
+        print("  -> [SESSION] cloudscraper (fallback)")
+        return s
+    except ImportError:
+        pass
+
+    # 3) 最終手段
+    s = requests.Session()
+    s.headers.update(_EXTRA_HEADERS)
+    s.headers["User-Agent"] = _UA_MAP["chrome124"]
+    print("  -> [SESSION] requests (last resort)")
+    return s
+
+
+# セッションの .get() をラップし、403/例外時にセッションを再生成する
+def _install_wrapper(session):
+    original_get = session.get
+
+    # 403 や接続エラー時に「セッションを新しく作り直して再試行」するラッパー関数
+    def safe_get(url, **kwargs):
+        global _scraper
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            # 人間によるアクセスを模倣するため、リクエスト前に1.5〜3.5秒のランダム待機を挟む
+            time.sleep(random.uniform(1.5, 3.5))
+
+            current = _scraper
+            try:
+                res = current._original_get(url, timeout=30, **kwargs)
+                # HTTPステータス200(成功) または 404(Not Found) の場合は正常応答として処理
+                if res.status_code in (200, 404):
+                    return res
+                print(
+                    f"  -> [WARNING] Cloudflare blocked (HTTP {res.status_code}). "
+                    f"Rotating session... (attempt {attempt + 1}/{max_attempts})"
+                )
+            except Exception as e:
+                print(
+                    f"  -> [WARNING] Connection error: {e}. "
+                    f"Rotating session... (attempt {attempt + 1}/{max_attempts})"
+                )
+
+            # 新しいフィンガープリントのセッションへ差し替え（UA・impersonate も再抽選）
+            _scraper = _install_wrapper(_build_session())
+            # 指数バックオフ（5秒 → 10秒 → 15秒 → 20秒）
+            time.sleep(5 * (attempt + 1))
+
+        # 再試行上限に達した場合は、安全なエラーハンドリングのためダミーのレスポンスを返す
+        class Dummy:
+            status_code = 403
+            content = b""
+            text = ""
+        return Dummy()
+
+    session._original_get = original_get
+    session.get = safe_get
+    return session
+
+
 # CloudflareのBot検知を回避するためのスクレイパーを取得する
-# GitHub Actions環境で最も安定してアクセス可能な設定(cloudscraper + User-Agent固定)を使用
+# 403を検知した場合はUA・TLSフィンガープリントを変えてセッションを自動再生成する
 def get_scraper():
     global _scraper
     if _scraper is None:
-        import cloudscraper
-        _scraper = cloudscraper.create_scraper()
-        _scraper.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        })
-
-        original_get = _scraper.get
-        
-        # 連続アクセス（Rate Limit）によるブロックを回避するためのラッパー関数
-        def safe_get(url, **kwargs):
-            max_attempts = 4
-            for attempt in range(max_attempts):
-                # 人間によるアクセスを模倣するため、リクエスト前に2.0〜4.5秒のランダムな待機時間を設ける
-                sleep_time = random.uniform(2.0, 4.5)
-                time.sleep(sleep_time)
-                
-                try:
-                    res = original_get(url, timeout=30, **kwargs)
-                    # HTTPステータス200(成功) または 404(Not Found) の場合は正常な応答として処理
-                    if res.status_code in (200, 404):
-                        return res
-                    
-                    print(f"  -> [WARNING] Cloudflare blocked (HTTP {res.status_code}). Cooling down...")
-                except Exception as e:
-                    print(f"  -> [WARNING] Connection error: {e}. Cooling down...")
-                
-                # アクセスが拒否された場合は5秒間待機し、再試行する
-                time.sleep(5)
-            
-            # 再試行上限に達した場合は、安全なエラーハンドリングのためにダミーのレスポンスオブジェクトを返す
-            class Dummy:
-                status_code = 403
-                content = b""
-                text = ""
-            return Dummy()
-
-        _scraper.get = safe_get
-        
+        _scraper = _install_wrapper(_build_session())
     return _scraper
 
 
-# 致命的なエラー発生時にメッセージを出力し、プロセスを終了する
-def panic(message: str):
-    print(message, file=sys.stderr)
-    sys.exit(1)
+# 明示的にセッションを破棄したい場合に呼ぶ
+def reset_scraper():
+    global _scraper
+    _scraper = None
+
+
+
 
 
 # 指定URLからファイルをチャンク単位でダウンロードし、保存する
@@ -73,7 +159,7 @@ def download(link: str, out: str, headers=None, use_scraper=True):
         # requestsを使用する場合も、連続アクセス防止のために待機時間を設ける
         time.sleep(random.uniform(1.0, 2.0))
         r = requests.get(link, stream=True, headers=headers)
-    
+
     if r.status_code != 200:
         raise RuntimeError(f"HTTP Error {r.status_code} for URL: {link}")
 
@@ -84,7 +170,7 @@ def download(link: str, out: str, headers=None, use_scraper=True):
 
 
 # シェルコマンドを実行し、失敗した場合は標準エラー出力にログを記録してプロセスを終了する
-def run_command(command: list[str]):
+def run_command(command: list):
     cmd = subprocess.run(command, capture_output=True, shell=True)
 
     try:
@@ -139,29 +225,29 @@ def patch_apk(
 
     print(f"Executing: {' '.join(command)}")
 
-    result = subprocess.run(command, capture_output=True, text=True)
-    
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+
     if result.stdout:
         print(result.stdout)
-    
+
     if result.returncode != 0:
         print("--- CLI Error Output ---", file=sys.stderr)
         print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr) 
+        print(result.stderr, file=sys.stderr)
         print("------------------------", file=sys.stderr)
-        result.check_returncode() 
+        result.check_returncode()
 
     # CLIの実行ログから「Saved to ...」を探し出し、動的に出力先ファイルパスを特定する
     if out is not None:
         output_text = (result.stdout or "") + "\n" + (result.stderr or "")
         match = re.search(r"Saved to\s+([^\r\n]+)", output_text)
-        
+
         if not match:
             print("[FATAL] Failed to parse output path from CLI log.", file=sys.stderr)
             sys.exit(1)
-            
+
         cli_output = match.group(1).strip()
-        
+
         if os.path.exists(cli_output):
             if os.path.exists(out):
                 os.unlink(out)
@@ -189,7 +275,7 @@ def publish_release(tag: str, files: list[str], message: str, title = ""):
         return result.returncode == 0
 
     if release_exists(tag):
-        print(f"Release '{tag}' already exists — deleting old release...")
+        print(f"Release '{tag}' already exists - deleting old release...")
 
         subprocess.run(
             ["gh", "release", "delete", tag, "-y"],
