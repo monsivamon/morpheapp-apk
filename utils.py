@@ -9,8 +9,53 @@ import re
 
 _scraper = None
 
+# 意図しないプロセス強制終了(sys.exit)を防ぐための例外
+class ProcessExitException(BaseException): pass
+
+def prevent_exit(code=0):
+    raise ProcessExitException(f"Process exit prevented! (exit code {code})")
+
+
+# エラー発生時にメッセージを出力して中断する
+def panic(message: str):
+    print(f"  -> [FATAL] {message}")
+    raise ProcessExitException(message)
+import os
+import shutil
+import subprocess
+import sys
+import time
+import random
+import requests
+import re
+
+_scraper = None
+
+# Cloudflare のチャレンジページ（HTTP 200 で返ってくる）かどうかを判定する
+# チャレンジページには downloadButton 等の要素が無いため、ここで 403 相当に変換して
+# 無駄なバリアント試行（39個問題）を防ぐ
+def _is_challenge_page(res) -> bool:
+    if res is None or getattr(res, "status_code", None) != 200:
+        return False
+    try:
+        text = (res.text or "")[:5000]
+    except Exception:
+        return False
+    markers = (
+        "Just a moment",
+        "cf-chl-",
+        "__cf_chl_",
+        "Checking your browser",
+        "Attention Required",
+        "challenge-platform",
+        "cf_chl_opt",
+    )
+    return any(m in text for m in markers)
+
+
 # CloudflareのBot検知を回避するためのスクレイパーを取得する
-# GitHub Actions環境で最も安定してアクセス可能な設定(cloudscraper + User-Agent固定)を使用
+# 実績のある cloudscraper をシングルトンで保持し、
+# チャレンジページ検出時は 403 相当のダミーレスポンスを返すラッパーを噛ませる
 def get_scraper():
     global _scraper
     if _scraper is None:
@@ -21,45 +66,29 @@ def get_scraper():
         })
 
         original_get = _scraper.get
-        
-        # 連続アクセス（Rate Limit）によるブロックを回避するためのラッパー関数
+
+        # チャレンジページを検出したら 403 相当のダミーを返すラッパー
         def safe_get(url, **kwargs):
-            max_attempts = 4
-            for attempt in range(max_attempts):
-                # 人間によるアクセスを模倣するため、リクエスト前に2.0〜4.5秒のランダムな待機時間を設ける
-                sleep_time = random.uniform(2.0, 4.5)
-                time.sleep(sleep_time)
-                
-                try:
-                    res = original_get(url, timeout=30, **kwargs)
-                    # HTTPステータス200(成功) または 404(Not Found) の場合は正常な応答として処理
-                    if res.status_code in (200, 404):
-                        return res
-                    
-                    print(f"  -> [WARNING] Cloudflare blocked (HTTP {res.status_code}). Cooling down...")
-                except Exception as e:
-                    print(f"  -> [WARNING] Connection error: {e}. Cooling down...")
-                
-                # アクセスが拒否された場合は5秒間待機し、再試行する
-                time.sleep(5)
-            
-            # 再試行上限に達した場合は、安全なエラーハンドリングのためにダミーのレスポンスオブジェクトを返す
-            class Dummy:
-                status_code = 403
-                content = b""
-                text = ""
-            return Dummy()
+            res = original_get(url, timeout=30, **kwargs)
+            if _is_challenge_page(res):
+                print("  -> [WARNING] Cloudflare challenge page detected (HTTP 200 -> treating as 403).")
+                class Dummy:
+                    status_code = 403
+                    content = b""
+                    text = ""
+                    headers = {}
+                return Dummy()
+            return res
 
         _scraper.get = safe_get
-        
+
     return _scraper
 
 
-# 致命的なエラー発生時にメッセージを出力し、プロセスを終了する
-def panic(message: str):
-    print(message, file=sys.stderr)
-    sys.exit(1)
-
+# 明示的にセッションを破棄したい場合に呼ぶ
+def reset_scraper():
+    global _scraper
+    _scraper = None
 
 # 指定URLからファイルをチャンク単位でダウンロードし、保存する
 def download(link: str, out: str, headers=None, use_scraper=True):
@@ -73,7 +102,7 @@ def download(link: str, out: str, headers=None, use_scraper=True):
         # requestsを使用する場合も、連続アクセス防止のために待機時間を設ける
         time.sleep(random.uniform(1.0, 2.0))
         r = requests.get(link, stream=True, headers=headers)
-    
+
     if r.status_code != 200:
         raise RuntimeError(f"HTTP Error {r.status_code} for URL: {link}")
 
@@ -84,7 +113,7 @@ def download(link: str, out: str, headers=None, use_scraper=True):
 
 
 # シェルコマンドを実行し、失敗した場合は標準エラー出力にログを記録してプロセスを終了する
-def run_command(command: list[str]):
+def run_command(command: list):
     cmd = subprocess.run(command, capture_output=True, shell=True)
 
     try:
@@ -139,29 +168,29 @@ def patch_apk(
 
     print(f"Executing: {' '.join(command)}")
 
-    result = subprocess.run(command, capture_output=True, text=True)
-    
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+
     if result.stdout:
         print(result.stdout)
-    
+
     if result.returncode != 0:
         print("--- CLI Error Output ---", file=sys.stderr)
         print(result.stdout, file=sys.stderr)
-        print(result.stderr, file=sys.stderr) 
+        print(result.stderr, file=sys.stderr)
         print("------------------------", file=sys.stderr)
-        result.check_returncode() 
+        result.check_returncode()
 
     # CLIの実行ログから「Saved to ...」を探し出し、動的に出力先ファイルパスを特定する
     if out is not None:
         output_text = (result.stdout or "") + "\n" + (result.stderr or "")
         match = re.search(r"Saved to\s+([^\r\n]+)", output_text)
-        
+
         if not match:
             print("[FATAL] Failed to parse output path from CLI log.", file=sys.stderr)
             sys.exit(1)
-            
+
         cli_output = match.group(1).strip()
-        
+
         if os.path.exists(cli_output):
             if os.path.exists(out):
                 os.unlink(out)
@@ -189,7 +218,7 @@ def publish_release(tag: str, files: list[str], message: str, title = ""):
         return result.returncode == 0
 
     if release_exists(tag):
-        print(f"Release '{tag}' already exists — deleting old release...")
+        print(f"Release '{tag}' already exists - deleting old release...")
 
         subprocess.run(
             ["gh", "release", "delete", tag, "-y"],

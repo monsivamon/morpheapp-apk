@@ -12,9 +12,10 @@ class Version:
 
 @dataclass
 class Variant:
-    is_bundle: bool  # APKがバンドル形式かどうか
-    link: str        # バリアントページへのリンク
-    architecture: str  # アーキテクチャ（例: arm64-v8a）
+    is_bundle: bool      # APKがバンドル形式かどうか
+    link: str            # バリアントページへのリンク
+    architecture: str    # アーキテクチャ（例: arm64-v8a）
+    dpi: str = ""        # Screen DPI（例: nodpi, 120-480dpi）
 
 
 # HTML要素の検索に失敗した場合の例外
@@ -75,8 +76,8 @@ def download_apk(variant: Variant, path: str = "big_file.apkm"):
 
     # 次のダウンロードページへ遷移
     download_page = get_scraper().get(download_page_link)
-    
-    # 【修正】response ではなく download_page のステータスを確認
+
+    # download_page のステータスを確認
     if download_page.status_code != 200:
         raise FailedToFetch(download_page_link)
 
@@ -98,11 +99,11 @@ def download_apk(variant: Variant, path: str = "big_file.apkm"):
     )
 
 
-# 指定されたバージョンの利用可能なバリアント（アーキテクチャ、バンドル形式）を取得する
+# 指定されたバージョンの利用可能なバリアント（アーキテクチャ、バンドル形式、DPI）を取得する
 def get_variants(version: Version) -> list[Variant]:
     url = version.link
     variants_page = get_scraper().get(url)
-    
+
     if variants_page is None or variants_page.status_code != 200:
         raise FailedToFetch(url)
 
@@ -123,15 +124,84 @@ def get_variants(version: Version) -> list[Variant]:
         is_bundle_tag = variant_row.find("span", {"class": "apkm-badge"})
         is_bundle = is_bundle_tag is not None and is_bundle_tag.string.strip() == "BUNDLE"
 
-        architecture: str = cells[1].string
-        
+        # cells: [Variant, Architecture, Minimum Version, Screen DPI]
+        architecture: str = cells[1].string if len(cells) > 1 and cells[1].string else ""
+        dpi: str = cells[3].string if len(cells) > 3 and cells[3].string else ""
+
         link_element = variant_row.find("a", {"class": "accent_color"})
         if link_element is None:
             continue
 
         link: str = f"https://www.apkmirror.com{link_element.attrs['href']}"
         variants.append(
-            Variant(is_bundle=is_bundle, link=link, architecture=architecture)
+            Variant(is_bundle=is_bundle, link=link, architecture=architecture, dpi=dpi)
         )
 
     return variants
+
+# ===================================================================
+# バリアント優先度付け
+#   アーキテクチャ: universal > arm64-v8a > armeabi-v7a
+#   DPI:           nodpi > 120-480dpi > 480-640dpi
+#   is_bundle は無視（merge_apk が自動処理するため）
+# ===================================================================
+
+# DPI ごとのスコアを返す
+def _dpi_score(dpi: str) -> int:
+    d = (dpi or "").lower()
+    if "nodpi" in d:    return 100   # 全端末共通：最優先
+    if "120-480" in d:  return 60    # 低〜高密度を広くカバー
+    if "480-640" in d:  return 30    # 高密度専用：汎用性低
+    if "480" in d:      return 20
+    return 0
+
+
+# Variant の優先度スコアを計算する（高いほど優先）
+def _variant_score(v: Variant) -> int:
+    arch = (v.architecture or "").lower()
+    is_universal = "universal" in arch
+    is_arm64 = "arm64" in arch
+    is_armv7 = "armeabi" in arch or "armv7" in arch
+
+    if not (is_universal or is_arm64 or is_armv7):
+        return -1   # x86 / x86_64 は除外
+
+    d = _dpi_score(v.dpi)
+
+    if is_universal: return 1000 + d
+    if is_arm64:     return 500 + d
+    if is_armv7:     return 100 + d
+    return -1
+
+
+# APKMirrorから利用可能なバリアントを優先度順にすべて取得する
+def get_target_apk_variants(base_url: str, target_version: str, app_id: str):
+    import time as _time
+    if not target_version:
+        return None, []
+    print(f"  -> Predicting direct URL for {app_id} v{target_version}...")
+    slug_version = target_version.replace('.', '-')
+    urls_to_try = [
+        f"{base_url}{app_id}-{slug_version}-release/",
+        f"{base_url}{app_id}-{slug_version}/",
+    ]
+
+    variants = []
+    target_v = None
+    for url in urls_to_try:
+        target_v = Version(version=target_version, link=url)
+        try:
+            variants = get_variants(target_v)
+            if variants: break
+        except BaseException:
+            _time.sleep(1)
+            continue
+
+    if not variants:
+        return None, []
+
+    scored = [(_variant_score(v), v) for v in variants]
+    scored = [(s, v) for s, v in scored if s > 0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    return target_v, [v for _, v in scored]
