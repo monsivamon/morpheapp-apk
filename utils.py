@@ -15,25 +15,12 @@ class ProcessExitException(BaseException): pass
 def prevent_exit(code=0):
     raise ProcessExitException(f"Process exit prevented! (exit code {code})")
 
-
 # エラー発生時にメッセージを出力して中断する
 def panic(message: str):
     print(f"  -> [FATAL] {message}")
     raise ProcessExitException(message)
-import os
-import shutil
-import subprocess
-import sys
-import time
-import random
-import requests
-import re
-
-_scraper = None
 
 # Cloudflare のチャレンジページ（HTTP 200 で返ってくる）かどうかを判定する
-# チャレンジページには downloadButton 等の要素が無いため、ここで 403 相当に変換して
-# 無駄なバリアント試行（39個問題）を防ぐ
 def _is_challenge_page(res) -> bool:
     if res is None or getattr(res, "status_code", None) != 200:
         return False
@@ -42,50 +29,48 @@ def _is_challenge_page(res) -> bool:
     except Exception:
         return False
     markers = (
-        "Just a moment",
-        "cf-chl-",
-        "__cf_chl_",
-        "Checking your browser",
-        "Attention Required",
-        "challenge-platform",
-        "cf_chl_opt",
+        "Just a moment", "cf-chl-", "__cf_chl_", "Checking your browser",
+        "Attention Required", "challenge-platform", "cf_chl_opt",
     )
     return any(m in text for m in markers)
 
-
 # CloudflareのBot検知を回避するためのスクレイパーを取得する
-# 実績のある cloudscraper をシングルトンで保持し、
-# チャレンジページ検出時は 403 相当のダミーレスポンスを返すラッパーを噛ませる
+class _HybridSession:
+    def __init__(self) -> None:
+        import cloudscraper
+        try:
+            self._primary = cloudscraper.create_scraper(enable_stealth=True)
+        except TypeError:
+            self._primary = cloudscraper.create_scraper()
+        self._primary.headers.update({"User-Agent": "APKUpdater-v3.0.3"})
+        self._fallback = None
+        self.headers = self._primary.headers
+        print("[scraper] primary: cloudscraper (stealth + APKUpdater UA)", flush=True)
+
+    def _get_fallback(self):
+        if self._fallback is None:
+            from curl_cffi import requests as curl_requests
+            self._fallback = curl_requests.Session(impersonate="chrome124")
+            print("[scraper] fallback: curl_cffi (Chrome 124 full impersonation)", flush=True)
+        return self._fallback
+
+    def get(self, *args, **kwargs):
+        r = self._primary.get(*args, **kwargs)
+        # 403 または チャレンジページが返ってきた場合は fallback に切り替え
+        if r.status_code == 403 or _is_challenge_page(r):
+            reason = "403" if r.status_code == 403 else "challenge page"
+            try: r.close()
+            except Exception: pass
+            print(f"[scraper] primary returned {reason}, retrying with curl_cffi...", flush=True)
+            r = self._get_fallback().get(*args, **kwargs)
+        return r
+
 def get_scraper():
     global _scraper
     if _scraper is None:
-        import cloudscraper
-        _scraper = cloudscraper.create_scraper()
-        _scraper.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        })
-
-        original_get = _scraper.get
-
-        # チャレンジページを検出したら 403 相当のダミーを返すラッパー
-        def safe_get(url, **kwargs):
-            res = original_get(url, timeout=30, **kwargs)
-            if _is_challenge_page(res):
-                print("  -> [WARNING] Cloudflare challenge page detected (HTTP 200 -> treating as 403).")
-                class Dummy:
-                    status_code = 403
-                    content = b""
-                    text = ""
-                    headers = {}
-                return Dummy()
-            return res
-
-        _scraper.get = safe_get
-
+        _scraper = _HybridSession()
     return _scraper
 
-
-# 明示的にセッションを破棄したい場合に呼ぶ
 def reset_scraper():
     global _scraper
     _scraper = None

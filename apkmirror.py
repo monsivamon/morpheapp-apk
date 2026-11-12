@@ -97,6 +97,11 @@ def download_apk(variant: Variant, path: str = "big_file.apkm"):
         headers={"Referer": download_page_link},
         use_scraper=True
     )
+    # CloudflareのHTMLページをAPKとして保存してしまうのを防ぐ
+    with open(path, "rb") as f:
+        magic = f.read(4)
+    if magic != b"PK\x03\x04":
+        raise RuntimeError(f"Downloaded file is not a valid ZIP/APK (magic={magic!r}). URL may be blocked by Cloudflare.")
 
 
 # 指定されたバージョンの利用可能なバリアント（アーキテクチャ、バンドル形式、DPI）を取得する
