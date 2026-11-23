@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from typing import cast
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup, Tag
-from utils import download, get_scraper
+from utils import download, get_scraper, resolve_apk_via_translate
 
 
 @dataclass
@@ -83,7 +84,13 @@ def download_apk(variant: Variant, path: str = "big_file.apkm"):
 
     download_page_body = BeautifulSoup(download_page.content, "html.parser")
 
-    direct_link = download_page_body.find("a", {"rel": "nofollow"})
+    # 中継経路のページには rel="nofollow" の外部リンクも混ざるため、
+    # download.php を指すリンクを優先して選ぶ。
+    nofollow_links = download_page_body.find_all("a", {"rel": "nofollow"})
+    direct_link = next(
+        (link for link in nofollow_links if "download.php" in (link.get("href") or "")),
+        nofollow_links[0] if nofollow_links else None,
+    )
     if direct_link is None:
         raise FailedToFindElement("download link")
 
@@ -91,17 +98,72 @@ def download_apk(variant: Variant, path: str = "big_file.apkm"):
     direct_link_url = f"https://www.apkmirror.com/{direct_link_href}"
     print(f"Direct link: {direct_link_url}")
 
-    download(
+    # download.php は 302 で署名付き CDN (r2.cloudflarestorage.com) へ転送する。
+    # リダイレクトを自前で処理し、APK本体は CDN から直接取得する
+    # （プロキシ設定時も HTML のみがプロキシを通り、帯域を消費しない）。
+    response = get_scraper().get(
         direct_link_url,
-        path,
         headers={"Referer": download_page_link},
-        use_scraper=True
+        allow_redirects=False,
+        stream=True,
     )
+    location = response.headers.get("Location") or response.headers.get("location")
+
+    if response.status_code in (301, 302, 303, 307, 308) and location:
+        try:
+            response.close()
+        except Exception:
+            pass
+        if _is_apkmirror_url(location):
+            download(location, path, headers={"Referer": direct_link_url}, use_scraper=True)
+        else:
+            print("  -> APK is served from CDN, downloading directly")
+            download(location, path, headers={"Referer": direct_link_url}, use_scraper=False)
+    elif response.status_code == 200 and "text/html" not in (
+        response.headers.get("Content-Type") or ""
+    ).lower():
+        print("  -> Saving APK from direct response")
+        with open(path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+        try:
+            response.close()
+        except Exception:
+            pass
+    else:
+        # 直接アクセスがブロックされた場合 (403 / チャレンジ HTML) は、
+        # 翻訳プロキシ経由で download.php の 302 を取り出し、署名付き CDN の
+        # URL を復元して APK 本体は CDN から直接取得する。
+        print(f"  -> HTTP {response.status_code}; resolving CDN URL via relay...")
+        try:
+            response.close()
+        except Exception:
+            pass
+        location = resolve_apk_via_translate(direct_link_url)
+        if not location:
+            print("  -> relay could not resolve; trying headless browser...")
+            try:
+                from browser import get_browser
+                location = get_browser().resolve_redirect(direct_link_url)
+            except Exception as e:
+                print(f"  -> browser fallback failed: {type(e).__name__}: {e}")
+                location = None
+        if not location:
+            raise RuntimeError(f"HTTP Error {response.status_code} for URL: {direct_link_url}")
+        print("  -> APK is served from CDN, downloading directly")
+        download(location, path, headers={"Referer": direct_link_url}, use_scraper=False)
+
     # CloudflareのHTMLページをAPKとして保存してしまうのを防ぐ
     with open(path, "rb") as f:
         magic = f.read(4)
     if magic != b"PK\x03\x04":
         raise RuntimeError(f"Downloaded file is not a valid ZIP/APK (magic={magic!r}). URL may be blocked by Cloudflare.")
+
+
+def _is_apkmirror_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "apkmirror.com" or host.endswith(".apkmirror.com")
 
 
 # 指定されたバージョンの利用可能なバリアント（アーキテクチャ、バンドル形式、DPI）を取得する

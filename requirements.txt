@@ -2,3 +2,4 @@ requests
 beautifulsoup4
 cloudscraper
 curl_cffi
+playwright

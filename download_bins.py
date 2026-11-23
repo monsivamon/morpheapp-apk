@@ -1,3 +1,4 @@
+import os
 import requests
 import re
 from utils import download
@@ -8,10 +9,18 @@ from utils import download
 def download_release_asset(repo: str, regex: str, out_dir: str, filename=None, include_prereleases: bool = False, version=None):
     url = f"https://api.github.com/repos/{repo}/releases"
 
-    # ヘッダーなしでシンプルにリクエスト
-    response = requests.get(url)
+    # 共有ランナーの IP では未認証 API が 403 (rate limit) になるため Token を付ける
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    response = requests.get(url, headers=headers, timeout=60)
     if response.status_code != 200:
-        raise Exception(f"Failed to fetch GitHub releases for {repo}")
+        raise Exception(f"Failed to fetch GitHub releases for {repo} (HTTP {response.status_code})")
 
     # プレリリースを含めるかどうかのフィルタリング
     releases = [r for r in response.json() if include_prereleases or not r.get("prerelease")]
@@ -42,7 +51,8 @@ def download_release_asset(repo: str, regex: str, out_dir: str, filename=None, i
         raise Exception(f"No asset matching regex '{regex}' found in release.")
 
     # utils.pyのdownload関数を呼び出して保存
-    download(link, f"{out_dir.lstrip('/')}/{filename}")
+    # GitHub の配信 URL を APKMirror 用スクレイパー/プロキシ経由にしない
+    download(link, f"{out_dir.lstrip('/')}/{filename}", use_scraper=False)
 
     return latest_release
 
